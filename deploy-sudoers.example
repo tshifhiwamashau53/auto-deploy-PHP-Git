@@ -1,0 +1,3 @@
+# Example sudoers snippet (do NOT install directly here; install.sh will create /etc/sudoers.d/deploy_auto)
+# Replace www-data with your webserver user and deploy with your deploy user
+www-data ALL=( deploy ) NOPASSWD: /usr/local/bin/deploy.sh
