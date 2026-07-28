@@ -1,0 +1,15 @@
+# systemd/auto-deploy.service.example
+
+[Unit]
+Description=Auto Deploy (example wrapper)
+After=network.target
+
+[Service]
+Type=oneshot
+User=deploy
+Group=deploy
+WorkingDirectory=/var/www/html/auto-deploy-PHP-Git
+ExecStart=/usr/bin/php /usr/local/bin/deploy deploy /var/www/html/auto-deploy-PHP-Git main
+
+[Install]
+WantedBy=multi-user.target

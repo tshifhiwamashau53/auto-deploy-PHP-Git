@@ -1,12 +1,9 @@
-/var/log/webhook_deploy.log /var/log/deploy_*.log {
+/var/log/auto-deploy.log /var/log/deploy_*.log {
     weekly
     rotate 6
     compress
     missingok
     notifempty
-    create 640 root adm
+    create 640 deploy adm
     sharedscripts
-    postrotate
-        # adjust if you have a logrotate-friendly service
-    endscript
 }

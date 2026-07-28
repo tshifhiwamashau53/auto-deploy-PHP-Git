@@ -1,67 +1,146 @@
 #!/usr/bin/env bash
 # install.sh
-# Helper to install the deployment scripts onto the server. Run as root.
-# This script will:
-# - create a deploy user (if missing)
-# - move deploy.sh to /usr/local/bin and set permissions
-# - create releases directory and set ownership
-# - create a sudoers file allowing the webserver user to run the deploy script as the deploy user
-# - print next steps (configure webserver, webhook secret)
+# Cross-distro installer for auto-deploy system. Run as root on the target server.
+# Usage: sudo bash install.sh /path/to/repo [web_user] [deploy_user] [--with-node] [--with-composer]
 
 set -euo pipefail
-
 REPO_DIR=${1:-/var/www/html/auto-deploy-PHP-Git}
 WEB_USER=${2:-www-data}
 DEPLOY_USER=${3:-deploy}
-DEPLOY_SCRIPT_DEST=/usr/local/bin/deploy.sh
-SUDOERS_FILE=/etc/sudoers.d/deploy_auto
+WITH_NODE=false
+WITH_COMPOSER=false
+
+for arg in "${@:4}"; do
+  case "$arg" in
+    --with-node) WITH_NODE=true ;;
+    --with-composer) WITH_COMPOSER=true ;;
+    *) echo "Unknown option: $arg" ;;
+  esac
+done
+
+# helpers
+log() { echo "[install] $*"; }
+run_apt() { apt-get update -y; apt-get install -y "$@"; }
+run_yum() { yum install -y "$@" || dnf install -y "$@"; }
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Please run as root: sudo bash install.sh /path/to/repo [web_user] [deploy_user]"
   exit 1
 fi
 
-echo "Creating deploy user if missing: $DEPLOY_USER"
-if ! id -u "$DEPLOY_USER" >/dev/null 2>&1; then
-  useradd -m -s /bin/bash "$DEPLOY_USER"
-  echo "User $DEPLOY_USER created"
-else
-  echo "User $DEPLOY_USER already exists"
-fi
-
-# Move deploy.sh to /usr/local/bin
-if [ ! -f "./deploy.sh" ]; then
-  echo "deploy.sh not found in current directory. Run this script from the repository root where deploy.sh exists."
+if [ ! -d "$REPO_DIR" ]; then
+  echo "Repo directory $REPO_DIR not found. Please clone the repository first into that path." >&2
   exit 2
 fi
 
-echo "Installing deploy.sh to $DEPLOY_SCRIPT_DEST"
-install -m 700 -o root -g root deploy.sh "$DEPLOY_SCRIPT_DEST"
+# detect distro
+. /etc/os-release || true
+ID_LIKE=${ID_LIKE:-}
+ID=${ID:-}
+log "Detected distro: $ID (like: $ID_LIKE)"
 
-# Create releases directory and set ownership
+# install packages
+if command -v apt-get >/dev/null 2>&1; then
+  log "Installing packages via apt"
+  PKGS=(git php-cli php-fpm php-curl php-zip curl openssl)
+  if $WITH_COMPOSER; then PKGS+=(composer); fi
+  run_apt "${PKGS[@]}"
+  if $WITH_NODE; then
+    curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+    apt-get install -y nodejs build-essential
+  fi
+elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
+  log "Installing packages via yum/dnf"
+  PKGS=(git php php-cli php-fpm php-curl php-zip curl openssl)
+  run_yum "${PKGS[@]}"
+  if $WITH_NODE; then
+    curl -fsSL https://rpm.nodesource.com/setup_18.x | bash -
+    yum install -y nodejs gcc-c++ make
+  fi
+else
+  echo "Unsupported package manager. Please install dependencies manually." >&2
+fi
+
+# create deploy user if missing
+if ! id -u "$DEPLOY_USER" >/dev/null 2>&1; then
+  log "Creating deploy user: $DEPLOY_USER"
+  useradd -m -s /bin/bash "$DEPLOY_USER"
+else
+  log "Deploy user $DEPLOY_USER already exists"
+fi
+
+# install CLI
+if [ -f "$REPO_DIR/bin/deploy" ]; then
+  log "Installing CLI to /usr/local/bin/deploy"
+  install -m 755 "$REPO_DIR/bin/deploy" /usr/local/bin/deploy
+else
+  log "Warning: $REPO_DIR/bin/deploy not found"
+fi
+
+# configure releases dir and current symlink
 mkdir -p "$REPO_DIR/releases"
 chown -R "$DEPLOY_USER":"$DEPLOY_USER" "$REPO_DIR"
+ln -sfn "$REPO_DIR" "$REPO_DIR/current" || true
 
-# Sudoers: allow webserver user to run only the deploy script as DEPLOY_USER
-cat > "$SUDOERS_FILE" <<EOF
-# Allow webserver to run deploy.sh as $DEPLOY_USER without password
-$WEB_USER ALL=( $DEPLOY_USER ) NOPASSWD: $DEPLOY_SCRIPT_DEST
+# sudoers entry
+SUDO_FILE=/etc/sudoers.d/auto-deploy
+CMD="/usr/bin/php /usr/local/bin/deploy"
+log "Writing sudoers file to $SUDO_FILE (allow $WEB_USER to run: $CMD)"
+cat > "$SUDO_FILE" <<EOF
+# Allow webserver to run the deploy CLI as $DEPLOY_USER
+$WEB_USER ALL=( $DEPLOY_USER ) NOPASSWD: $CMD
 EOF
-chmod 440 "$SUDOERS_FILE"
+chmod 0440 "$SUDO_FILE"
 
-echo "Created sudoers file at $SUDOERS_FILE"
+# setup log file
+LOG=/var/log/auto-deploy.log
+touch "$LOG"
+chown "$DEPLOY_USER":"$DEPLOY_USER" "$LOG"
+chmod 0640 "$LOG"
 
-echo "Installation complete. Next steps (must be done manually):"
+# install logrotate config
+LOGROTATE=/etc/logrotate.d/auto-deploy
+cat > "$LOGROTATE" <<'EOF'
+/var/log/auto-deploy.log /var/log/deploy_*.log {
+    weekly
+    rotate 6
+    compress
+    missingok
+    notifempty
+    create 640 deploy adm
+    sharedscripts
+}
+EOF
+chmod 0644 "$LOGROTATE"
+
+# optional systemd service example
+SERVICE_EXAMPLE=$REPO_DIR/systemd/auto-deploy.service.example
+mkdir -p "$REPO_DIR/systemd"
+cat > "$SERVICE_EXAMPLE" <<'EOF'
+[Unit]
+Description=Auto Deploy (example wrapper)
+After=network.target
+
+[Service]
+Type=oneshot
+User=deploy
+Group=deploy
+WorkingDirectory=/var/www/html/auto-deploy-PHP-Git
+ExecStart=/usr/bin/php /usr/local/bin/deploy deploy /var/www/html/auto-deploy-PHP-Git main
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+log "Installation complete. Next steps:"
 cat <<STEPS
-1) Configure your webserver to serve deploy.php via HTTPS and restrict access to GitHub webhook IPs if possible.
-   Example nginx location is provided in README.md.
-2) Set the environment variables for your webserver process (for deploy.php):
-   - GITHUB_WEBHOOK_SECRET (strong random string)
-   - DEPLOY_SCRIPT (default /usr/local/bin/deploy.sh)
-   - DEPLOY_USER (default deploy)
-   - REPO_DIR (path to repo, defaults to $REPO_DIR)
-   - DEPLOY_BRANCH (branch to deploy, default main)
-3) Create the GitHub webhook pointing to your deploy.php URL with the secret.
-4) Test by pushing to the configured branch and watch /var/log/deploy_*.log and webhook log.
+1) Edit your PHP-FPM pool to set GITHUB_WEBHOOK_SECRET, REPO_DIR, DEPLOY_BRANCH (see README).
+2) Configure your webserver to call public/webhook.php on the /hooks/deploy path (HTTPS only).
+3) Add the public key for the 'deploy' user to GitHub as a Deploy Key if your site repo is private.
+4) Create the GitHub webhook (payload URL -> https://yourserver/hooks/deploy, secret = GITHUB_WEBHOOK_SECRET).
+5) Test by pushing to the configured branch.
+
+If you want the script to also install Composer or Node, re-run with --with-composer and/or --with-node (if apt/yum repos are available).
 STEPS
 
+exit 0
