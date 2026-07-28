@@ -4,9 +4,20 @@ Complete step-by-step README for installing, configuring, testing, and troublesh
 
 > Summary
 
-This project provides a small PHP webhook and shell-based deployment tool that can be installed on Debian/Ubuntu or RHEL/CentOS-like systems. It supports running composer/node tasks, validating Git[...] 
+This project provides a small PHP webhook and shell-based deployment tool that can be installed on Debian/Ubuntu or RHEL/CentOS-like systems. It supports running composer/node tasks, validating Git HMAC signatures, and safe deployments with atomic releases, healthchecks, and optional rollback.
 
 This README collects all instructions you need so you won't get lost when you start.
+
+---
+
+## Important changes / Quick notes
+
+Important: this installer now expects you to do two extra steps so the webhook works securely and predictably on a server:
+
+1. Run `composer install` in this repo so `vendor/autoload.php` and the PHP CLI (`bin/deploy`) work.
+2. Install a small wrapper (`/usr/local/bin/auto-deploy-run`) and add a tightly-scoped sudoers entry that lets the webserver run only that wrapper as the non-root `deploy` user. This keeps the webhook process from executing arbitrary commands and makes the sudoers policy easy to audit.
+
+(You can find copy-paste snippets for both the wrapper and the sudoers entry in the "Make it work on the server" section below.)
 
 ---
 
@@ -14,18 +25,25 @@ This README collects all instructions you need so you won't get lost when you st
 
 1. Clone the repo to your server (example path /opt/auto-deploy):
 
+   ```bash
    sudo git clone https://github.com/tshifhiwamashau53/auto-deploy-PHP-Git.git /opt/auto-deploy
+   cd /opt/auto-deploy
+   ```
 
 2. Run the installer as root (example):
 
+   ```bash
    sudo bash /opt/auto-deploy/install.sh /opt/auto-deploy www-data deploy --with-composer --with-node
+   ```
 
-   - Arguments: <install-path> <web-user> <deploy-user>
+   - Arguments: `<install-path> <web-user> <deploy-user>`
    - Flags: `--with-composer` installs/uses composer during deploy, `--with-node` installs/uses node/npm during deploy.
 
-3. Configure environment variables (see Configuration below). Restart services if you change PHP-FPM or web server config.
+3. IMPORTANT: after cloning, run composer in the tool repo (see Make it work on the server below).
 
-4. Configure a GitHub webhook on your repository (see Webhook setup below) and test it.
+4. Configure environment variables (see Configuration below). Restart services if you change PHP-FPM or web server config.
+
+5. Configure a GitHub webhook on your repository (see Webhook setup below) and test it.
 
 ---
 
@@ -36,6 +54,85 @@ This README collects all instructions you need so you won't get lost when you st
 - A system user for the webserver (example: `www-data`, `nginx`, `apache`) and a dedicated deploy user (example: `deploy`).
 - PHP CLI and PHP-FPM (version compatible with your app). The installer tries to install PHP packages, but on RHEL/CentOS you may need EPEL/Remi.
 - Optional: composer (for PHP dependencies) and node/npm (for frontend builds).
+
+---
+
+## Make it work on the server (exact copy-paste snippets)
+
+These are the exact files and commands we recommend creating on the server. Adjust paths and usernames to match your environment.
+
+1) Wrapper script (recommended)
+
+Create `/usr/local/bin/auto-deploy-run` (root-owned, exact path used in sudoers):
+
+```bash
+#!/usr/bin/env bash
+# wrapper: run the AutoDeploy PHP CLI from the installed repo
+# Usage: /usr/local/bin/auto-deploy-run <command> <repo> [branch]
+exec /usr/bin/php /opt/auto-deploy/bin/deploy "$@"
+```
+
+Then make it executable:
+
+```bash
+sudo chmod 750 /usr/local/bin/auto-deploy-run
+```
+
+2) Sudoers snippet (tight, exact permission)
+
+Create `/etc/sudoers.d/deploy-auto` using visudo and the exact contents below (DO NOT use wildcards):
+
+```text
+# Allow webserver (www-data) to run only the wrapper as deploy user, no password
+Defaults:www-data !requiretty
+www-data ALL=(deploy) NOPASSWD: /usr/local/bin/auto-deploy-run
+```
+
+Save with `sudo visudo -f /etc/sudoers.d/deploy-auto` and ensure the file mode is `0440`.
+
+3) PHP-FPM pool environment variables (example)
+
+Add these `env[...]` lines to your PHP-FPM pool file (e.g. `/etc/php/<version>/fpm/pool.d/www.conf`) and restart PHP-FPM.
+
+```ini
+; add these lines in your pool config and restart php-fpm
+env[GITHUB_WEBHOOK_SECRET] = "your_secret_here"
+env[DEPLOY_BRANCH]        = main
+env[DEPLOY_USER]          = deploy
+env[REPO_DIR]             = /var/www/myapp
+env[DEPLOY_LOGFILE]       = /var/log/auto-deploy/deploy.log
+```
+
+4) Composer install (required for webhook and PHP CLI)
+
+From the auto-deploy tool directory on the server, run (as the `deploy` user):
+
+```bash
+cd /opt/auto-deploy
+sudo -u deploy composer install --no-dev --prefer-dist --optimize-autoloader
+```
+
+This creates `vendor/autoload.php` required by the webhook and CLI.
+
+5) Manual deploy test (copy/paste)
+
+Run the same command the webhook will run. Replace repo path and branch as needed:
+
+```bash
+# Run as the deploy user (or test as webserver user if you prefer)
+sudo -u deploy /usr/local/bin/auto-deploy-run deploy /var/www/myapp main
+# or test wrapper as webserver user:
+sudo -u www-data /usr/local/bin/auto-deploy-run deploy /var/www/myapp main
+```
+
+6) Webhook HMAC test (simulate GitHub push)
+
+```bash
+PAYLOAD='{"ref":"refs/heads/main"}'
+SECRET='your_secret_here'
+SIG='sha256='$(printf "%s" "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')
+curl -X POST -H "X-Hub-Signature-256: $SIG" -H "Content-Type: application/json" --data "$PAYLOAD" https://your-domain/path/to/webhook.php
+```
 
 ---
 
@@ -56,15 +153,16 @@ After running, inspect the install log and files under the install path before e
 
 ## Files of interest
 
-- `public/webhook.php` - The webhook endpoint that validates GitHub HMAC sha256 signatures and triggers the deploy command via sudo.
-- `deploy.sh` - Shell deploy helper that performs the actual git pull, composer install, npm build steps if enabled.
-- `deploy.php` - PHP CLI helper wrapper (if used) that may call the shell script or do app-specific tasks.
+- `public/webhook.php` - The webhook endpoint that validates GitHub HMAC sha256 signatures and triggers the deploy command via sudo (configured via env).
+- `bin/deploy` - PHP CLI deploy tool (Symfony Console) that performs atomic releases and uses `src/` classes.
+- `deploy.sh` - Shell deploy helper (alternative) that performs an atomic release, healthcheck, and cleanup.
+- `deploy.php` - PHP helper wrapper (example) that may also be used to call the shell script.
 - `install.sh` - Installer script for the host.
 - `deploy-sudoers.example` - Example sudoers line for allowing the webserver or webhook process to run the deploy command as the deploy user.
 - `systemd/auto-deploy.service.example` - Example systemd unit to run the deploy task.
 - `logrotate.deploy` - Example logrotate configuration for deployment logs.
 - `nginx.deploy.conf` - Example nginx configuration for serving the webhook (optional).
-- `bin/` and `src/` - Supporting scripts and PHP classes.
+- `bin/`, `src/` - Supporting scripts and PHP classes.
 
 ---
 
@@ -117,7 +215,7 @@ Paste the exact lines and save. Ensure file permissions are 0440.
 4. Secret: the same value you set in `GITHUB_WEBHOOK_SECRET`.
 5. Choose events: `Just the push event` is usually sufficient.
 
-public/webhook.php expects the `X-Hub-Signature-256` header and will reject requests where the HMAC does not match.
+`public/webhook.php` expects the `X-Hub-Signature-256` header and will reject requests where the HMAC does not match.
 
 Testing the webhook locally (example):
 
@@ -153,7 +251,7 @@ If you prefer systemd to execute deploy actions (one-shot), see `systemd/auto-de
   sudo systemctl daemon-reload
   sudo systemctl enable --now auto-deploy.service
 
-Edit the Service unit to point to the correct paths and user. For one-shot runs you may prefer a timer unit that triggers after a webhook writes a trigger file — this repo only contains an exam[...] 
+Edit the Service unit to point to the correct paths and user. For one-shot runs you may prefer a timer unit that triggers after a webhook writes a trigger file — this repo only contains an example.
 
 ---
 
@@ -203,12 +301,27 @@ Copy `logrotate.deploy` to `/etc/logrotate.d/auto-deploy` and adjust the `log` p
 
 ---
 
-## Security notes
+## Short post-install checklist
 
-- The webhook secret must remain secret. Do not commit it to the repository. Store in environment variables or a secrets manager.
-- Limit allowed sudo commands to only the deploy scripts and use NOPASSWD only on those commands.
-- Serve the webhook endpoint over HTTPS and restrict access by IP or additional authentication if possible.
-- Consider rate-limiting or filtering incoming requests to the webhook endpoint.
+- [ ] created non-root deploy user and added SSH deploy key (if repo private)
+- [ ] cloned app to DEPLOY_PATH as deploy user
+- [ ] cloned auto-deploy tool to /opt/auto-deploy and ran composer install
+- [ ] created /usr/local/bin/auto-deploy-run wrapper and chmod 750
+- [ ] added /etc/sudoers.d/deploy-auto with exact wrapper entry (0440)
+- [ ] set PHP-FPM pool env variables and restarted php-fpm
+- [ ] created /var/log/auto-deploy with correct ownership
+- [ ] created GitHub webhook with matching secret
+- [ ] tested manual deploy and webhook delivery
+
+---
+
+## Short troubleshooting hints
+
+- 500 error from webhook → `vendor/autoload.php` missing? Run `composer install` in `/opt/auto-deploy`.
+- 403 Invalid signature → webhook secret mismatch or wrong HMAC body; check PHP-FPM env and GitHub secret.
+- `sudo: a password is required` → sudoers file wrong; verify exact path and run `visudo -f /etc/sudoers.d/deploy-auto`.
+- `git fetch` fails → deploy user SSH key not configured or wrong permissions on `/home/deploy/.ssh`.
+- No logfile entries → check `DEPLOY_LOGFILE` and that the webserver/deploy user can write it.
 
 ---
 
@@ -220,43 +333,8 @@ Copy `logrotate.deploy` to `/etc/logrotate.d/auto-deploy` and adjust the `log` p
 
 ---
 
-## Common commands reference
-
-Clone repo to desired path:
-
-  sudo git clone https://github.com/tshifhiwamashau53/auto-deploy-PHP-Git.git /opt/auto-deploy
-
-Run installer:
-
-  sudo bash /opt/auto-deploy/install.sh /opt/auto-deploy www-data deploy --with-composer --with-node
-
-Run deploy manually as deploy user:
-
-  sudo -u deploy -i /opt/auto-deploy/deploy.sh
-
-Compute HMAC and test webhook:
-
-  PAYLOAD='{ "ref":"refs/heads/main" }'
-  SECRET='your_secret'
-  SIG='sha256='$(printf "%s" "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')
-  curl -X POST -H "X-Hub-Signature-256: $SIG" -H "Content-Type: application/json" --data "$PAYLOAD" https://your-server.example.com/webhook.php
-
----
-
-## FAQ
-
-Q: Can I run this on shared hosting?
-A: Only if the host allows creation of system users and running custom sudoers entries; many shared hosts won't allow this. Prefer VPS or dedicated host.
-
-Q: Will this run on RHEL/CentOS?
-A: Yes, but you may need to enable EPEL/Remi repos for modern PHP and Node packages. The installer logs will note missing packages.
-
-Q: How do I add notifications?
-A: Add a webhook URL into Notification class env var and enable sending in the deploy flow; see `src/` for hints.
-
----
-
 ## Where to look next (suggested order when starting)
+
 1. Inspect `install.sh` and understand what it will change on your server.
 2. Review `deploy-sudoers.example` and prepare `/etc/sudoers.d/deploy-auto` with correct user and script paths.
 3. Run the installer on a staging server first.
