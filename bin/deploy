@@ -1,0 +1,76 @@
+#!/usr/bin/env php
+<?php
+require __DIR__ . '/../vendor/autoload.php';
+
+use Symfony\Component\Console\Application;
+use Symfony\Component\Console\Command\Command;
+use Symfony\Component\Console\Input\InputArgument;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Output\OutputInterface;
+use Monolog\Logger;
+use Monolog\Handler\StreamHandler;
+use AutoDeploy\Config;
+use AutoDeploy\Notification;
+use AutoDeploy\Deployer;
+use AutoDeploy\Rollback;
+
+$logPath = Config::logPath();
+$logger = new Logger('cli');
+$dir = dirname($logPath);
+if (!is_dir($dir)) mkdir($dir, 0755, true);
+$logger->pushHandler(new StreamHandler($logPath, Logger::DEBUG));
+$notifier = new Notification($logger);
+
+$app = new Application('AutoDeploy CLI', '1.0.0');
+
+$app->register('deploy')
+    ->setDescription('Run a deploy now')
+    ->addArgument('repo', InputArgument::OPTIONAL, 'Repository directory', Config::repoDir())
+    ->addArgument('branch', InputArgument::OPTIONAL, 'Branch', Config::env('DEPLOY_BRANCH', 'main'))
+    ->setCode(function (InputInterface $input, OutputInterface $output) use ($logger, $notifier) {
+        $repo = $input->getArgument('repo');
+        $branch = $input->getArgument('branch');
+        $deployer = new Deployer($logger, $notifier);
+        $code = $deployer->deploy($repo, $branch);
+        $output->writeln($code === 0 ? '<info>Deploy finished</info>' : '<error>Deploy failed</error>');
+        return $code;
+    });
+
+$app->register('rollback')
+    ->setDescription('Rollback to previous release')
+    ->addArgument('repo', InputArgument::OPTIONAL, 'Repository directory', Config::repoDir())
+    ->setCode(function (InputInterface $input, OutputInterface $output) use ($logger, $notifier) {
+        $repo = $input->getArgument('repo');
+        $rb = new Rollback($logger, $notifier);
+        $ok = $rb->rollback($repo);
+        $output->writeln($ok ? '<info>Rollback done</info>' : '<error>Rollback failed</error>');
+        return $ok ? 0 : 1;
+    });
+
+$app->register('list')
+    ->setDescription('List releases')
+    ->addArgument('repo', InputArgument::OPTIONAL, 'Repository directory', Config::repoDir())
+    ->setCode(function (InputInterface $input, OutputInterface $output) {
+        $repo = $input->getArgument('repo');
+        $dir = rtrim($repo, '/') . '/releases';
+        if (!is_dir($dir)) {
+            $output->writeln('<comment>No releases directory</comment>');
+            return 0;
+        }
+        $items = glob($dir . '/*', GLOB_ONLYDIR);
+        usort($items, function ($a, $b) { return strcmp($b, $a); });
+        foreach ($items as $i) $output->writeln($i);
+        return 0;
+    });
+
+$app->register('setup-logs')
+    ->setDescription('Create log directory')
+    ->setCode(function (InputInterface $input, OutputInterface $output) use ($logger) {
+        $log = Config::logPath();
+        $dir = dirname($log);
+        if (!is_dir($dir)) mkdir($dir, 0755, true);
+        $output->writeln('<info>Logs ready: ' . $log . '</info>');
+        return 0;
+    });
+
+$app->run();
