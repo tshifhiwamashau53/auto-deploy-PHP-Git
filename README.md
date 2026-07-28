@@ -343,10 +343,3 @@ Copy `logrotate.deploy` to `/etc/logrotate.d/auto-deploy` and adjust the `log` p
 6. Inspect `logs/deploy.log` and make adjustments to `deploy.sh` to match your project's needs.
 
 ---
-
-If you'd like, I can:
-- Commit a per-distro PHP-FPM pool example and nginx/apache examples for CentOS/RHEL into the repo,
-- Add Slack/Teams notification implementation into `src/Notification.php` with instructions,
-- Add an automated systemd timer example or a webhook-to-systemd trigger snippet.
-
-Tell me which of the above you want and I'll add it.
